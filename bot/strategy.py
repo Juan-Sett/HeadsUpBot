@@ -36,6 +36,11 @@ PARAMS = {
     # The "expected number of bets" variant (False) beat the guide bot a bit
     # more but lost ~1 bb/deal head-to-head to v2 and halved the always_pot edge.
     "nbets_all": True,
+    # future-betting line preflop: "all" (bet every street), "expected",
+    # "blend" (by kappa) or "none"; postflop: "all", "expected" or "blend"
+    "pre_fut": "all", "post_fut": "all",
+    # button never folds first-in when its equity vs a random hand is at least this (1 = off)
+    "limp_floor": 0.46,       # checked on two held-out seed sets vs v1-v3 and archetypes
     # action model
     "tau": 0.07, "prior_n": 15.0, "eps_prior": 0.10, "eps_n": 20.0, "weak_h": 0.30,
     "slow_prior": 0.35, "slow_n": 10.0, "strong_h": 0.75, "kappa_n": 6.0,
@@ -223,11 +228,19 @@ def _preflop(obs, memory, hs, opp_actions) -> Action:
     e2 = pf.interp(row, min(x, cont) * a_flop)
     fut = {"agg": agg, "agg_now": 0.0, "kappa": _kappa(om),
            "f_next": om.freqs("flop_bet")[0], "steal_w": PARAMS["steal_w"],
-           "nbets_all": PARAMS["nbets_all"],
+           "nbets_mode": PARAMS["pre_fut"] if PARAMS["pre_fut"] != "none" else "all",
            "eq_agg": [min(1.0, max(0.0, e1 + sd * z)) for z in _GH_LIST],
            "eq_agg_c": [min(1.0, max(0.0, e2 + sd * z)) for z in _GH_LIST]}
+    if PARAMS["pre_fut"] == "none":
+        fut = None          # preflop: equity realization only, no future-betting line
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), PARAMS["commit_spr"], fut)
-    return pick(evs, obs.pot, eq, PARAMS["delta"], PARAMS["mix"], hs["rng"])
+    action = pick(evs, obs.pot, eq, PARAMS["delta"], PARAMS["mix"], hs["rng"])
+    # Limp floor: as the button facing only the big blind (1 chip into 3), don't
+    # fold reasonable hands; the one-step preflop model is too pessimistic there.
+    if (action == Action.FOLD and not opp_actions and obs.to_call == 1
+            and row[0] >= PARAMS["limp_floor"]):
+        action = Action.CHECK_CALL
+    return action
 
 
 _STREETS = (Street.FLOP, Street.TURN, Street.RIVER)
@@ -455,7 +468,8 @@ def _postflop(obs, memory, hs, opp_actions) -> Action:
         agg_now = float(om.freqs(f"{street_name}_open")[2]) if opp_to_act else 0.0
         fut = {"agg": agg, "agg_now": agg_now, "eq_agg": eq_agg, "eq_agg_c": eq_agg_c,
                "kappa": _kappa(om), "f_next": om.freqs(f"{_SNAME[nxt]}_bet")[0],
-               "steal_w": P["steal_w"], "nbets_all": P["nbets_all"]}
+               "steal_w": P["steal_w"], "nbets_all": P["nbets_all"],
+               "nbets_mode": P["post_fut"]}
     t5 = time.perf_counter(); st[4] += t5 - t4
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), P["commit_spr"], fut)
     action = pick(evs, obs.pot, eq, P["delta"], P["mix"], hs["rng"])

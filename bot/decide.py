@@ -98,7 +98,16 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
     kap = fut.get("kappa", 1.0)
     f_next = 0.0 if river else fut.get("f_next", 0.0)
     steal_w = fut.get("steal_w", 0.0)
-    nb_all = fut.get("nbets_all", False)    # True: assume a bet on every remaining street
+    nb_mode = fut.get("nbets_mode") or ("all" if fut.get("nbets_all", False) else "expected")
+
+    def nb(streets):
+        """Number of pot-size bets in the aggressive line: on every street ("all"),
+        the expected number given >= 1 ("expected"), or in between by kappa
+        ("blend": blind aggressors -> all, strength-driven bettors -> expected)."""
+        if nb_mode == "all":
+            return float(len(streets))
+        e = _n_bets(streets)
+        return e if nb_mode == "expected" else e + kap * (len(streets) - e)
     evs = {}
     for a in obs.legal_actions:
         if a == Action.FOLD:
@@ -107,7 +116,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
             if tc == 0:
                 streets = agg + [fut["agg_now"]]
                 p_more = _future(streets)
-                n = len(agg) + (1 if fut["agg_now"] > 0 else 0) if nb_all else _n_bets(streets)
+                n = nb([x for x in streets if x > 0])
                 passive = eq * pot if river else _passive(eq, pot, rho_pos, f_next, steal_w)
                 aggr = _aggr_line(fut["eq_agg"], pot, n, obs.my_stack, obs.opp_stack, kap)
                 evs[a] = (1.0 - p_more) * passive + p_more * aggr
@@ -121,7 +130,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
                 else:
                     p_more = _future(agg)
                     passive = _passive(eq, P, rho_pos, f_next, steal_w) - amt
-                    aggr = _aggr_line(fut["eq_agg"], P, len(agg) if nb_all else _n_bets(agg), my_left, obs.opp_stack, kap) - amt
+                    aggr = _aggr_line(fut["eq_agg"], P, nb(agg), my_left, obs.opp_stack, kap) - amt
                     evs[a] = (1.0 - p_more) * passive + p_more * aggr
         else:
             target = obs.raise_to[a]
@@ -140,7 +149,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
             else:
                 p_more = _future(agg)
                 passive = _passive(eq_c[a], P, rho_pos, f_next, steal_w) - add
-                aggr = _aggr_line(fut["eq_agg_c"], P, len(agg) if nb_all else _n_bets(agg), my_left, opp_left, kap) - add
+                aggr = _aggr_line(fut["eq_agg_c"], P, nb(agg), my_left, opp_left, kap) - add
                 called = (1.0 - p_more) * passive + p_more * aggr
             p = phi[a]
             evs[a] = p * pot + (1.0 - p) * called
