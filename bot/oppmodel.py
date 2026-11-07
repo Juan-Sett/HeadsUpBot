@@ -130,6 +130,15 @@ class OppModel:
         sp = (v[3] + self.p["slow_prior"] * n0) / (v[2] + n0)
         return float(min(0.95, max(0.0, sp)))
 
+    def kappa(self, phase: str = "post") -> float:
+        """How much betting ignores hand strength: P(raise | weak) / P(raise | strong)
+        from showdowns (1 = raises regardless, 0 = raises only strong hands)."""
+        n0 = self.p["kappa_n"]
+        v = self.sd[phase]
+        r_weak = (v[1] + 0.25 * n0) / (v[0] + n0)
+        r_strong = ((v[2] - v[3]) + 0.5 * n0) / (v[2] + n0)
+        return float(min(1.0, max(0.0, r_weak / max(0.05, r_strong))))
+
     # ---- per-hand bookkeeping --------------------------------------------
     def end_hand(self, opp_actions: list[dict]) -> None:
         """Update counts and the autopilot detector with one finished hand's

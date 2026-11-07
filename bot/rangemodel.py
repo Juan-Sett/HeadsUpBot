@@ -231,7 +231,14 @@ class Particles:
     def apply(self, board, act, freqs, tau, eps, slow=0.0):
         """act: dict with blen, kind ('fold'/'pass'/'raise'), facing."""
         h = self.h_at(board, act["blen"])
-        theta_r, theta_f = thetas(h, self.w, freqs)
+        if act["blen"] == 0:
+            # Preflop: h is the absolute class percentile and the context
+            # frequencies are measured against the whole range, so the cutoffs
+            # are absolute (raise = top f_raise of ALL hands), not quantiles of
+            # the already-narrowed range.
+            theta_r, theta_f = 1.0 - freqs[2], freqs[0]
+        else:
+            theta_r, theta_f = thetas(h, self.w, freqs)
         ev = {"blen": act["blen"], "kind": act["kind"], "facing": act["facing"],
               "theta_r": theta_r, "theta_f": theta_f, "tau": tau, "eps": eps, "slow": slow}
         self.w = self.w * self._lik(h, ev)

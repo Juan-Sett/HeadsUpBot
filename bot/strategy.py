@@ -31,7 +31,7 @@ PARAMS = {
     "sd_pre": 0.20, "lam_flop": 0.70,
     # action model
     "tau": 0.07, "prior_n": 15.0, "eps_prior": 0.10, "eps_n": 20.0, "weak_h": 0.30,
-    "slow_prior": 0.35, "slow_n": 10.0, "strong_h": 0.75,
+    "slow_prior": 0.35, "slow_n": 10.0, "strong_h": 0.75, "kappa_n": 6.0,
     "half_life": 150.0,
     # decision rule
     "delta": 0.02, "mix": 0.10,
@@ -180,16 +180,24 @@ def _rho(obs) -> float:
 
 def _preflop(obs, memory, hs, opp_actions) -> Action:
     om: OppModel = memory["om"]
-    # The opponent's range: the top X where X multiplies their raise
-    # frequencies (a limp or check keeps a wide range).
+    # The opponent's range as the top x of ALL hands. Preflop frequencies are
+    # measured against the whole range, so each action is an absolute cutoff:
+    # a raise keeps the top f_raise, a call of a raise keeps the top (1 - f_fold).
+    # A limp or a check keeps the range wide.
     x = 1.0
     for a in opp_actions:
+        f = om.freqs(a["ctx"])
         if a["kind"] == "raise":
-            x *= max(0.03, float(om.freqs(a["ctx"])[2]))
+            x = min(x, max(0.03, f[2]))
+        elif a["kind"] == "pass" and a["facing"] and a["ctx"] != "pre_open":
+            x = min(x, max(0.03, 1.0 - f[0]))
     row = pf.EQ_ROWS[pf.class_index(obs.hole_cards)]
     eq = pf.interp(row, x)
-    fold = om.freqs("pre_facing")[0]
-    eq_c_val = pf.interp(row, x * (1.0 - fold))
+    # If we raise: the opponent continues with the top (1 - f_fold) of all
+    # hands, so within its current range (top x) it folds 1 - (1 - f_fold) / x.
+    cont = max(0.03, 1.0 - om.freqs("pre_facing")[0])
+    fold = max(0.0, 1.0 - cont / x)
+    eq_c_val = pf.interp(row, min(x, cont))
     raises = [a for a in obs.legal_actions if a in (Action.RAISE_HALF, Action.RAISE_POT)]
     phi = {a: fold for a in raises}
     eq_c = {a: eq_c_val for a in raises}
@@ -199,8 +207,8 @@ def _preflop(obs, memory, hs, opp_actions) -> Action:
     a_flop = max(0.08, agg[0])
     sd = PARAMS["sd_pre"]
     e1 = pf.interp(row, x * a_flop)
-    e2 = pf.interp(row, x * (1.0 - fold) * a_flop)
-    fut = {"agg": agg, "agg_now": 0.0,
+    e2 = pf.interp(row, min(x, cont) * a_flop)
+    fut = {"agg": agg, "agg_now": 0.0, "kappa": _kappa(om),
            "eq_agg": [min(1.0, max(0.0, e1 + sd * z)) for z in _GH_LIST],
            "eq_agg_c": [min(1.0, max(0.0, e2 + sd * z)) for z in _GH_LIST]}
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), PARAMS["commit_spr"], fut)
@@ -214,6 +222,12 @@ _GH_NODES = _GH_NODES / _GH_NODES.std()
 _GH_LIST = _GH_NODES.tolist()
 _SNAME = {Street.FLOP: "flop", Street.TURN: "turn", Street.RIVER: "river"}
 _OPEN_CTX = {s: f"{n}_open" for s, n in _SNAME.items()}
+
+
+def _kappa(om) -> float:
+    """How much the opponent's postflop betting ignores its cards: bluff rate
+    over the raise rate of strong hands (1 = bets regardless, 0 = only strong)."""
+    return om.kappa("post")
 
 
 def _street_aggression(om, first: Street) -> list:
@@ -418,7 +432,8 @@ def _postflop(obs, memory, hs, opp_actions) -> Action:
         opp_to_act = obs.to_call == 0 and not any(
             (not a["is_me"]) and a["street"] == obs.street for a in hs["parsed"])
         agg_now = float(om.freqs(f"{street_name}_open")[2]) if opp_to_act else 0.0
-        fut = {"agg": agg, "agg_now": agg_now, "eq_agg": eq_agg, "eq_agg_c": eq_agg_c}
+        fut = {"agg": agg, "agg_now": agg_now, "eq_agg": eq_agg, "eq_agg_c": eq_agg_c,
+               "kappa": _kappa(om)}
     t5 = time.perf_counter(); st[4] += t5 - t4
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), P["commit_spr"], fut)
     action = pick(evs, obs.pot, eq, P["delta"], P["mix"], hs["rng"])

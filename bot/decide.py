@@ -31,7 +31,8 @@ def _future(a_streets) -> float:
     return 1.0 - q
 
 
-def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float) -> float:
+def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float,
+               kappa: float = 1.0) -> float:
     """EV (from here) of the line where the opponent bets pot on each of n_bets
     streets: we either call down to the end or fold (worth 0), whichever is
     better. A pot-size bet plus a call triples the pot, so we put in pot*(3^n - 1)/2.
@@ -45,9 +46,17 @@ def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float)
     total = pot + 2.0 * x
     if isinstance(eq_agg, (int, float)):
         return max(eq_agg * total - x, 0.0)
+    # Keep the fold option (bad next streets are worth 0, not a loss). The
+    # upside above our average equity counts only as far as the opponent's
+    # betting ignores its cards (kappa = 1: always_pot / random; kappa = 0: a
+    # strength-driven bettor, who stops paying on runouts that turn against it).
     if isinstance(eq_agg, list):
-        return sum(max(e * total - x, 0.0) for e in eq_agg) / len(eq_agg)
-    return float(np.maximum(eq_agg * total - x, 0.0).mean())
+        m = sum(eq_agg) / len(eq_agg)
+        return sum(max((e if e <= m else m + kappa * (e - m)) * total - x, 0.0)
+                   for e in eq_agg) / len(eq_agg)
+    m = float(eq_agg.mean())
+    e = np.where(eq_agg <= m, eq_agg, m + kappa * (eq_agg - m))
+    return float(np.maximum(e * total - x, 0.0).mean())
 
 
 def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr: float,
@@ -67,6 +76,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
     pot, tc = obs.pot, obs.to_call
     river = obs.street == Street.RIVER
     agg = [] if river else list(fut["agg"])
+    kap = fut.get("kappa", 1.0)
     evs = {}
     for a in obs.legal_actions:
         if a == Action.FOLD:
@@ -76,7 +86,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
                 p_more = _future(agg + [fut["agg_now"]])
                 n = len(agg) + (1 if fut["agg_now"] > 0 else 0)
                 passive = (1.0 if river else rho_pos) * eq * pot
-                aggr = _aggr_line(fut["eq_agg"], pot, n, obs.my_stack, obs.opp_stack)
+                aggr = _aggr_line(fut["eq_agg"], pot, n, obs.my_stack, obs.opp_stack, kap)
                 evs[a] = (1.0 - p_more) * passive + p_more * aggr
             else:
                 amt = min(tc, obs.my_stack)
@@ -88,7 +98,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
                 else:
                     p_more = _future(agg)
                     passive = rho_pos * eq * P - amt
-                    aggr = _aggr_line(fut["eq_agg"], P, len(agg), my_left, obs.opp_stack) - amt
+                    aggr = _aggr_line(fut["eq_agg"], P, len(agg), my_left, obs.opp_stack, kap) - amt
                     evs[a] = (1.0 - p_more) * passive + p_more * aggr
         else:
             target = obs.raise_to[a]
@@ -107,7 +117,7 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
             else:
                 p_more = _future(agg)
                 passive = rho_pos * eq_c[a] * P - add
-                aggr = _aggr_line(fut["eq_agg_c"], P, len(agg), my_left, opp_left) - add
+                aggr = _aggr_line(fut["eq_agg_c"], P, len(agg), my_left, opp_left, kap) - add
                 called = (1.0 - p_more) * passive + p_more * aggr
             p = phi[a]
             evs[a] = p * pot + (1.0 - p) * called
