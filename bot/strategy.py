@@ -23,12 +23,19 @@ from .oppmodel import BOARD_LEN, OppModel, parse_history
 
 PARAMS = {
     # equity realization when betting can still follow
-    "rho_ip": 1.00, "rho_oop": 0.88,
+    "rho_ip": 1.08, "rho_oop": 0.80,      # tuned; checked on held-out seeds vs v1/v2/guide/tag
     # a raise is valued as all-in if our stack left <= this * pot after the call
     "commit_spr": 1.5,
     # spread of our equity on the next street (option value of folding later):
     # preflop -> flop (Gaussian sd), flop runouts shrunk toward the mean by lam
-    "sd_pre": 0.20, "lam_flop": 0.70,
+    "sd_pre": 0.20, "lam_flop": 0.90,      # sd_pre > 0.2 made us exploitable by v1
+    # weight on our own later-street fold equity in the passive branch
+    # (0 = off: on held-out seeds it was neutral vs archetypes)
+    "steal_w": 0.0,
+    # future-aggression line: True = assume a bet on every remaining street.
+    # The "expected number of bets" variant (False) beat the guide bot a bit
+    # more but lost ~1 bb/deal head-to-head to v2 and halved the always_pot edge.
+    "nbets_all": True,
     # action model
     "tau": 0.07, "prior_n": 15.0, "eps_prior": 0.10, "eps_n": 20.0, "weak_h": 0.30,
     "slow_prior": 0.35, "slow_n": 10.0, "strong_h": 0.75, "kappa_n": 6.0,
@@ -46,9 +53,9 @@ PARAMS = {
     # autopilot exploit
     "ap_streak": 6, "ap_hands": 10,
     # time governor (seconds of thinking per half on this machine)
-    "time_target": 3.6, "max_decision": 0.040, "low_budget_frac": 0.05,
+    "time_target": 3.0, "max_decision": 0.040, "low_budget_frac": 0.05,
     # judge-charged seconds per half we allow (server mode only; the bank is 8 s)
-    "bank_target": 7.0,
+    "bank_target": 6.0,
 }
 
 
@@ -73,7 +80,8 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["hs"] = None
     memory["cpu0"] = time.process_time()
     memory["t"] = {"spent": 0.0, "post_spent": 0.0, "post_dec": 0, "dec": 0,
-                   "speed": 1.0, "voi_mean": 1.0, "ovh": 0.0005, "quick_per_sample": 1.2e-5}
+                   "speed": 1.0, "voi_mean": 1.0, "ovh": 0.0005, "quick_per_sample": 1.2e-5,
+                   "cpu_in": 0.0}
     memory["diag"] = {"errors": 0, "fallback": 0, "heuristic_time": 0, "quick": 0, "autopilot_dec": 0,
                       "ess_min": [], "resample": 0, "post_dec": 0, "error_msgs": [],
                       # postflop time by stage: events, evaluate, apply+eq, fold model, future, EV+pick
@@ -82,6 +90,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
 
 def choose_action(obs: Observation, memory: dict) -> Action:
     t0 = time.perf_counter()
+    c0 = time.process_time()
     try:
         action = _choose(obs, memory)
     except Exception as exc:  # never let a bug reach the judge
@@ -92,19 +101,23 @@ def choose_action(obs: Observation, memory: dict) -> Action:
             action = Action.CHECK_CALL
     if action not in obs.legal_actions:
         action = Action.CHECK_CALL
-    memory["t"]["spent"] += time.perf_counter() - t0
-    memory["t"]["dec"] += 1
+    t = memory["t"]
+    t["spent"] += time.perf_counter() - t0
+    t["cpu_in"] += time.process_time() - c0
+    t["dec"] += 1
     return action
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
     t0 = time.perf_counter()
+    c0 = time.process_time()
     try:
         _hand_end(result, memory)
     except Exception as exc:
         _note_error(memory, exc)
     try:
         memory["t"]["spent"] += time.perf_counter() - t0
+        memory["t"]["cpu_in"] += time.process_time() - c0
     except Exception:
         pass
 
@@ -209,6 +222,8 @@ def _preflop(obs, memory, hs, opp_actions) -> Action:
     e1 = pf.interp(row, x * a_flop)
     e2 = pf.interp(row, min(x, cont) * a_flop)
     fut = {"agg": agg, "agg_now": 0.0, "kappa": _kappa(om),
+           "f_next": om.freqs("flop_bet")[0], "steal_w": PARAMS["steal_w"],
+           "nbets_all": PARAMS["nbets_all"],
            "eq_agg": [min(1.0, max(0.0, e1 + sd * z)) for z in _GH_LIST],
            "eq_agg_c": [min(1.0, max(0.0, e2 + sd * z)) for z in _GH_LIST]}
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), PARAMS["commit_spr"], fut)
@@ -252,13 +267,19 @@ def _budget(obs, memory) -> tuple[float, bool]:
     post_rate = (t["post_dec"] + 1.5 * 30) / (hands_done + 30)
     remaining = P["time_target"] - t["spent"] - other_per_hand * hands_left
     if SERVER:
-        # The judge charges whole requests (minus 1 ms each), framework included.
+        # The judge charges each request's wall time minus 1 ms, web framework
+        # included. We see the framework only as process CPU time outside our
+        # functions; under a CPU limit (Kubernetes) wall time runs ahead of CPU
+        # time, so scale it by the wall/CPU ratio measured inside our functions.
         calls = max(1, t["dec"])
-        charged = time.process_time() - memory["cpu0"] - 0.0008 * calls
-        plumbing_per_call = max(0.0, charged - t["spent"]) / calls
+        cpu_out = max(0.0, time.process_time() - memory["cpu0"] - t["cpu_in"])
+        ratio = t["spent"] / t["cpu_in"] if t["cpu_in"] > 0.25 else 1.0
+        ratio = min(4.0, max(1.0, ratio))
+        plumbing = cpu_out * ratio
+        charged = max(t["spent"], t["spent"] + plumbing - 0.0008 * calls)
         calls_per_hand = calls / hands_done
-        bank_left = (P["bank_target"] - charged
-                     - (plumbing_per_call + other_per_hand / max(1e-9, calls_per_hand)) * calls_per_hand * hands_left)
+        plumb_per_hand = max(0.0, plumbing / calls - 0.0008) * calls_per_hand
+        bank_left = P["bank_target"] - charged - (plumb_per_hand + other_per_hand) * hands_left
         remaining = min(remaining, bank_left)
     if remaining < P["low_budget_frac"] * P["time_target"]:
         return 0.0, True
@@ -433,7 +454,8 @@ def _postflop(obs, memory, hs, opp_actions) -> Action:
             (not a["is_me"]) and a["street"] == obs.street for a in hs["parsed"])
         agg_now = float(om.freqs(f"{street_name}_open")[2]) if opp_to_act else 0.0
         fut = {"agg": agg, "agg_now": agg_now, "eq_agg": eq_agg, "eq_agg_c": eq_agg_c,
-               "kappa": _kappa(om)}
+               "kappa": _kappa(om), "f_next": om.freqs(f"{_SNAME[nxt]}_bet")[0],
+               "steal_w": P["steal_w"], "nbets_all": P["nbets_all"]}
     t5 = time.perf_counter(); st[4] += t5 - t4
     evs = action_evs(obs, eq, phi, eq_c, _rho(obs), P["commit_spr"], fut)
     action = pick(evs, obs.pot, eq, P["delta"], P["mix"], hs["rng"])

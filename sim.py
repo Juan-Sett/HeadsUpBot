@@ -52,10 +52,13 @@ from game import (  # noqa: E402
 
 BASELINES = ["random", "calling_station", "always_half", "always_pot"]
 ARCHETYPES = ["guide", "nit", "maniac", "overfolder", "timebank_death"]
+HELDOUT = ["tag", "lag"]           # never used for tuning
 POOLS = {
     "baselines": BASELINES,
     "archetypes": ARCHETYPES,
     "all": BASELINES + ARCHETYPES,
+    "heldout": HELDOUT,
+    "everything": BASELINES + ARCHETYPES + HELDOUT,
 }
 
 # Module names that belong to a bot and must be re-imported fresh per half.

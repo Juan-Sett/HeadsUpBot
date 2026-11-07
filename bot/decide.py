@@ -31,7 +31,13 @@ def _future(a_streets) -> float:
     return 1.0 - q
 
 
-def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float,
+def _n_bets(a_streets) -> float:
+    """Expected number of streets the opponent bets, given that it bets at least once."""
+    p = _future(a_streets)
+    return sum(a_streets) / p if p > 1e-9 else 0.0
+
+
+def _aggr_line(eq_agg, pot: float, n_bets: float, my_left: float, opp_left: float,
                kappa: float = 1.0) -> float:
     """EV (from here) of the line where the opponent bets pot on each of n_bets
     streets: we either call down to the end or fold (worth 0), whichever is
@@ -40,7 +46,7 @@ def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float,
     eq_agg is our equity vs the betting range: a number, or an array of the
     equities we may have on the next street (we decide after seeing it, so
     the fold option is worth something)."""
-    x = min(my_left, opp_left, pot * (3 ** n_bets - 1) / 2.0)
+    x = min(my_left, opp_left, pot * (3.0 ** n_bets - 1.0) / 2.0)
     if x <= 0:
         return 0.0
     total = pot + 2.0 * x
@@ -59,6 +65,19 @@ def _aggr_line(eq_agg, pot: float, n_bets: int, my_left: float, opp_left: float,
     return float(np.maximum(e * total - x, 0.0).mean())
 
 
+def _passive(eq: float, pot: float, rho: float, f_next: float, steal_w: float) -> float:
+    """Value of the branch where the opponent never bets again: check it down
+    (rho * eq * pot), or bet half pot on a later street when checked to. The
+    opponent folds f_next of the time; the hands that call are stronger, so
+    our equity vs them is shaded down."""
+    down = rho * eq * pot
+    if f_next <= 0.0 or steal_w <= 0.0:
+        return down
+    eq_call = eq * (1.0 - 0.5 * f_next)
+    bet = f_next * pot + (1.0 - f_next) * (rho * eq_call * 2.0 * pot - 0.5 * pot)
+    return down + steal_w * max(0.0, bet - down)
+
+
 def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr: float,
                fut: dict | None = None) -> dict:
     """EV of every legal action, aware of future aggression.
@@ -68,24 +87,28 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
         agg_now  P(opponent bets this street after our check) (0 if our check closes it)
         eq_agg   our equity vs the part of the range that keeps betting
         eq_agg_c same, after the opponent called our raise
-    With probability a = 1 - prod(1 - agg) the opponent keeps betting pot every
-    street; then we stack off or fold, whichever is better. Otherwise the
-    hand checks down and we realize rho * eq of the pot.
+    With probability a = 1 - prod(1 - agg) the opponent bets again: on
+    sum(agg) / a streets on average, pot-sized; we call down or fold, whichever
+    is better. Otherwise the hand checks down and we realize rho * eq of the pot.
     """
     fut = fut or {"agg": [], "agg_now": 0.0, "eq_agg": eq, "eq_agg_c": eq}
     pot, tc = obs.pot, obs.to_call
     river = obs.street == Street.RIVER
     agg = [] if river else list(fut["agg"])
     kap = fut.get("kappa", 1.0)
+    f_next = 0.0 if river else fut.get("f_next", 0.0)
+    steal_w = fut.get("steal_w", 0.0)
+    nb_all = fut.get("nbets_all", False)    # True: assume a bet on every remaining street
     evs = {}
     for a in obs.legal_actions:
         if a == Action.FOLD:
             evs[a] = 0.0
         elif a == Action.CHECK_CALL:
             if tc == 0:
-                p_more = _future(agg + [fut["agg_now"]])
-                n = len(agg) + (1 if fut["agg_now"] > 0 else 0)
-                passive = (1.0 if river else rho_pos) * eq * pot
+                streets = agg + [fut["agg_now"]]
+                p_more = _future(streets)
+                n = len(agg) + (1 if fut["agg_now"] > 0 else 0) if nb_all else _n_bets(streets)
+                passive = eq * pot if river else _passive(eq, pot, rho_pos, f_next, steal_w)
                 aggr = _aggr_line(fut["eq_agg"], pot, n, obs.my_stack, obs.opp_stack, kap)
                 evs[a] = (1.0 - p_more) * passive + p_more * aggr
             else:
@@ -97,8 +120,8 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
                     evs[a] = eq * P - amt
                 else:
                     p_more = _future(agg)
-                    passive = rho_pos * eq * P - amt
-                    aggr = _aggr_line(fut["eq_agg"], P, len(agg), my_left, obs.opp_stack, kap) - amt
+                    passive = _passive(eq, P, rho_pos, f_next, steal_w) - amt
+                    aggr = _aggr_line(fut["eq_agg"], P, len(agg) if nb_all else _n_bets(agg), my_left, obs.opp_stack, kap) - amt
                     evs[a] = (1.0 - p_more) * passive + p_more * aggr
         else:
             target = obs.raise_to[a]
@@ -116,8 +139,8 @@ def action_evs(obs, eq: float, phi: dict, eq_c: dict, rho_pos: float, commit_spr
                 called = eq_c[a] * (P + 2 * x) - x - add
             else:
                 p_more = _future(agg)
-                passive = rho_pos * eq_c[a] * P - add
-                aggr = _aggr_line(fut["eq_agg_c"], P, len(agg), my_left, opp_left, kap) - add
+                passive = _passive(eq_c[a], P, rho_pos, f_next, steal_w) - add
+                aggr = _aggr_line(fut["eq_agg_c"], P, len(agg) if nb_all else _n_bets(agg), my_left, opp_left, kap) - add
                 called = (1.0 - p_more) * passive + p_more * aggr
             p = phi[a]
             evs[a] = p * pot + (1.0 - p) * called
