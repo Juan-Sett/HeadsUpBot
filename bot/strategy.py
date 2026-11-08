@@ -41,6 +41,8 @@ PARAMS = {
     "pre_fut": "all", "post_fut": "all",
     # button never folds first-in when its equity vs a random hand is at least this (1 = off)
     "limp_floor": 0.46,       # checked on two held-out seed sets vs v1-v3 and archetypes
+    # button calls a raise after limping when eq vs the raiser's range >= price + margin (None = off)
+    "ip_call_margin": 0.14, "ip_call_max_price": 0.30,
     # action model
     "tau": 0.07, "prior_n": 15.0, "eps_prior": 0.10, "eps_n": 20.0, "weak_h": 0.30,
     "slow_prior": 0.35, "slow_n": 10.0, "strong_h": 0.75, "kappa_n": 6.0,
@@ -111,6 +113,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     t["cpu_in"] += time.process_time() - c0
     t["dec"] += 1
     return action
+
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
@@ -240,6 +243,15 @@ def _preflop(obs, memory, hs, opp_actions) -> Action:
     if (action == Action.FOLD and not opp_actions and obs.to_call == 1
             and row[0] >= PARAMS["limp_floor"]):
         action = Action.CHECK_CALL
+    # Same idea after we limp the button and get raised: in position at a cheap
+    # price, call when our equity vs the raiser's range clears the price.
+    m = PARAMS["ip_call_margin"]
+    if (m is not None and action == Action.FOLD and obs.is_button and obs.to_call > 0
+            and opp_actions and opp_actions[-1]["kind"] == "raise"
+            and not any(a["is_me"] and a["kind"] == "raise" for a in hs["parsed"])):
+        needed = obs.to_call / (obs.pot + obs.to_call)
+        if needed <= PARAMS["ip_call_max_price"] and eq >= needed + m:
+            action = Action.CHECK_CALL
     return action
 
 
