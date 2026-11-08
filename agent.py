@@ -39,8 +39,8 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 # rename as your team/bot's name
-PARTICIPANT = "JuanSett"
-AGENT_NAME = "RangeEV"
+PARTICIPANT = "Stacklords"
+AGENT_NAME = "Bot_bot"
 
 # The strategy lives in bot/ (range model, EV decisions, opponent model,
 # time governor). Importing it here also loads its tables at startup.
